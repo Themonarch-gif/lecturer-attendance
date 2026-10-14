@@ -388,7 +388,8 @@ export default function ManageCoursePage() {
     </h2>
 
     <p className="mt-1 text-sm text-slate-500">
-      Start an attendance session and generate a temporary attendance code.
+      Start a 90-second attendance session with a QR code, or scan a
+      student's QR code to review their details.
     </p>
   </div>
 
@@ -420,6 +421,16 @@ export default function ManageCoursePage() {
       >
         Start Attendance
       </button>
+      
+<button
+  type="button"
+  onClick={() =>
+    router.push(`/dashboard/courses/${courseId}/attendance/scan`)
+  }
+  className="rounded-lg border-2 border-blue-800 bg-blue-700 px-5 py-3 font-bold text-white shadow-md transition-colors hover:bg-blue-900 focus:outline-none focus:ring-4 focus:ring-blue-300"
+>
+  Scan Student QR
+</button>
 
       <button
         type="submit"

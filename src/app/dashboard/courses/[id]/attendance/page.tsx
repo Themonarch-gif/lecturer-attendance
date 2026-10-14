@@ -1,7 +1,9 @@
+
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
+import { QRCodeSVG } from "qrcode.react";
 import { createClient } from "@/lib/supabase/client";
 
 type Course = {
@@ -13,7 +15,7 @@ type Course = {
 
 type AttendanceSession = {
   id: string;
-  attendance_code: string;
+  session_token: string;
   started_at: string;
   expires_at: string;
 };
@@ -23,22 +25,20 @@ export default function AttendancePage() {
   const params = useParams();
   const courseId = params.id as string;
 
-  const supabase = createClient();
+  const supabase = useMemo(() => createClient(), []);
 
   const [course, setCourse] = useState<Course | null>(null);
-  const [session, setSession] = useState<AttendanceSession | null>(null);
-
+  const [session, setSession] =
+    useState<AttendanceSession | null>(null);
   const [timeLeft, setTimeLeft] = useState(0);
-
   const [loading, setLoading] = useState(true);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
 
-  // --------------------------------------------------
-  // Load course and active attendance session
-  // --------------------------------------------------
-
+  // Load the course and any active QR attendance session.
   useEffect(() => {
+    let cancelled = false;
+
     async function loadAttendancePage() {
       setLoading(true);
       setError("");
@@ -52,59 +52,58 @@ export default function AttendancePage() {
         return;
       }
 
-      // Load course
-      const { data: courseData, error: courseError } = await supabase
-        .from("courses")
-        .select("id, course_name, course_code, course_units")
-        .eq("id", courseId)
-        .eq("lecturer_id", user.id)
-        .single();
+      const { data: courseData, error: courseError } =
+        await supabase
+          .from("courses")
+          .select("id, course_name, course_code, course_units")
+          .eq("id", courseId)
+          .eq("lecturer_id", user.id)
+          .single();
+
+      if (cancelled) return;
 
       if (courseError || !courseData) {
-        setError("Course not found.");
+        setError("Course not found or you do not have access.");
         setLoading(false);
         return;
       }
 
       setCourse(courseData);
 
-      // Look for an active attendance session
-      const now = new Date().toISOString();
+      const { data: activeSession, error: sessionError } =
+        await supabase
+          .from("attendance_sessions")
+          .select("id, session_token, started_at, expires_at")
+          .eq("course_id", courseId)
+          .eq("lecturer_id", user.id)
+          .not("session_token", "is", null)
+          .gt("expires_at", new Date().toISOString())
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
 
-      const { data: activeSession, error: sessionError } = await supabase
-        .from("attendance_sessions")
-        .select("id, attendance_code, started_at, expires_at")
-        .eq("course_id", courseId)
-        .eq("lecturer_id", user.id)
-        .gt("expires_at", now)
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      if (cancelled) return;
 
       if (sessionError) {
         console.error(sessionError);
-        setError("Unable to load attendance session.");
+        setError("Unable to load the attendance session.");
         setLoading(false);
         return;
       }
 
       if (activeSession) {
         setSession(activeSession);
-
-        const remaining = Math.max(
-          0,
-          Math.ceil(
-            (new Date(activeSession.expires_at).getTime() -
-              Date.now()) /
-              1000
+        setTimeLeft(
+          Math.max(
+            0,
+            Math.ceil(
+              (new Date(activeSession.expires_at).getTime() -
+                Date.now()) /
+                1000
+            )
           )
         );
-
-        setTimeLeft(remaining);
       } else {
-        // Important:
-        // No active session means the lecturer should see
-        // the Start Attendance button.
         setSession(null);
         setTimeLeft(0);
       }
@@ -113,19 +112,20 @@ export default function AttendancePage() {
     }
 
     loadAttendancePage();
-  }, [courseId, router]);
 
-  // --------------------------------------------------
-  // Countdown timer
-  // --------------------------------------------------
+    return () => {
+      cancelled = true;
+    };
+  }, [courseId, router, supabase]);
 
+  // Countdown: the database expiry time is the source of truth.
   useEffect(() => {
     if (!session) {
       setTimeLeft(0);
       return;
     }
 
-    const interval = setInterval(() => {
+    const updateCountdown = () => {
       const remaining = Math.max(
         0,
         Math.ceil(
@@ -135,127 +135,90 @@ export default function AttendancePage() {
       );
 
       setTimeLeft(remaining);
+    };
 
-      if (remaining <= 0) {
-        clearInterval(interval);
-      }
-    }, 250);
+    updateCountdown();
+
+    const interval = setInterval(updateCountdown, 1000);
 
     return () => clearInterval(interval);
   }, [session]);
 
-  // --------------------------------------------------
-  // Generate random 4-digit attendance code
-  // --------------------------------------------------
-
-  function generateAttendanceCode() {
-    return Math.floor(1000 + Math.random() * 9000).toString();
-  }
-
-  // --------------------------------------------------
-  // Start attendance
-  // --------------------------------------------------
-
+  // Create a new QR session.
   async function handleStartAttendance() {
-    if (!course) return;
+    if (!course || starting) return;
 
     setStarting(true);
     setError("");
 
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
+    try {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
 
-    if (!user) {
-      router.push("/login");
-      return;
-    }
+      if (!user) {
+        router.push("/login");
+        return;
+      }
 
-    // Check whether an active session already exists
-    const now = new Date();
+      // Reuse an active QR session rather than creating duplicates.
+      const { data: existingSession, error: lookupError } =
+        await supabase
+          .from("attendance_sessions")
+          .select("id, session_token, started_at, expires_at")
+          .eq("course_id", course.id)
+          .eq("lecturer_id", user.id)
+          .not("session_token", "is", null)
+          .gt("expires_at", new Date().toISOString())
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
 
-    const { data: existingSession, error: existingError } =
-      await supabase
-        .from("attendance_sessions")
-        .select("id, attendance_code, started_at, expires_at")
-        .eq("course_id", course.id)
-        .eq("lecturer_id", user.id)
-        .gt("expires_at", now.toISOString())
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      if (lookupError) {
+        throw lookupError;
+      }
 
-    if (existingError) {
-      console.error(existingError);
-      setError("Unable to check for an active session.");
-      setStarting(false);
-      return;
-    }
+      if (existingSession) {
+        setSession(existingSession);
+        return;
+      }
 
-    // If an active session already exists, reuse it
-    if (existingSession) {
-      setSession(existingSession);
-
-      const remaining = Math.max(
-        0,
-        Math.ceil(
-          (new Date(existingSession.expires_at).getTime() -
-            Date.now()) /
-            1000
-        )
+      // Generate an unpredictable token using the browser's
+      // cryptographically secure UUID generator.
+      const sessionToken = crypto.randomUUID();
+      const startedAt = new Date();
+      const expiresAt = new Date(
+        startedAt.getTime() + 90 * 1000
       );
 
-      setTimeLeft(remaining);
+      const { data: newSession, error: insertError } =
+        await supabase
+          .from("attendance_sessions")
+          .insert({
+            course_id: course.id,
+            lecturer_id: user.id,
+            session_token: sessionToken,
+            attendance_code: null,
+            started_at: startedAt.toISOString(),
+            expires_at: expiresAt.toISOString(),
+          })
+          .select("id, session_token, started_at, expires_at")
+          .single();
+
+      if (insertError || !newSession) {
+        throw insertError ?? new Error("Session creation failed.");
+      }
+
+      setSession(newSession);
+    } catch (err) {
+      console.error(err);
+      setError(
+        "Unable to start attendance. Please check your connection and try again."
+      );
+    } finally {
       setStarting(false);
-      return;
     }
-
-    // Create a new session
-    const startedAt = new Date();
-    const expiresAt = new Date(
-      startedAt.getTime() + 90 * 1000
-    );
-
-    const attendanceCode = generateAttendanceCode();
-
-    const { data: newSession, error: insertError } =
-      await supabase
-        .from("attendance_sessions")
-        .insert({
-          course_id: course.id,
-          lecturer_id: user.id,
-          attendance_code: attendanceCode,
-          started_at: startedAt.toISOString(),
-          expires_at: expiresAt.toISOString(),
-        })
-        .select(
-          "id, attendance_code, started_at, expires_at"
-        )
-        .single();
-
-    if (insertError || !newSession) {
-      console.error(insertError);
-      setError("Unable to start attendance. Please try again.");
-      setStarting(false);
-      return;
-    }
-
-    setSession(newSession);
-
-    setTimeLeft(
-      Math.ceil(
-        (new Date(newSession.expires_at).getTime() -
-          Date.now()) /
-          1000
-      )
-    );
-
-    setStarting(false);
   }
-
-  // --------------------------------------------------
-  // Format countdown
-  // --------------------------------------------------
 
   function formatTime(seconds: number) {
     const minutes = Math.floor(seconds / 60);
@@ -266,59 +229,58 @@ export default function AttendancePage() {
       .padStart(2, "0")}`;
   }
 
-  // --------------------------------------------------
-  // Loading
-  // --------------------------------------------------
-
-  if (loading) {
-    return (
-      <main className="min-h-screen bg-slate-50 px-6 py-10">
-        <div className="mx-auto max-w-4xl">
-          <div className="rounded-2xl bg-white p-8 shadow-sm">
-            <p className="text-slate-500">
-              Loading attendance...
-            </p>
-          </div>
-        </div>
-      </main>
+  function viewHistory() {
+    router.push(
+      `/dashboard/courses/${courseId}/attendance/history`
     );
   }
-
-  // --------------------------------------------------
-  // Error
-  // --------------------------------------------------
-
-  if (error && !course) {
-    return (
-      <main className="min-h-screen bg-slate-50 px-6 py-10">
-        <div className="mx-auto max-w-4xl">
-          <div className="rounded-2xl bg-white p-8 shadow-sm">
-            <p className="text-red-600">{error}</p>
-
-            <button
-              type="button"
-              onClick={() => router.back()}
-              className="mt-6 rounded-xl bg-slate-900 px-5 py-3 font-semibold text-white"
-            >
-              Go Back
-            </button>
-          </div>
-        </div>
-      </main>
-    );
-  }
-
-  // --------------------------------------------------
-  // Determine whether attendance is currently active
-  // --------------------------------------------------
 
   const attendanceActive =
     session !== null && timeLeft > 0;
 
+  // This is the agreed placeholder payload for integration.
+  // The student scanner must be updated to read this format.
+  const qrPayload = session
+    ? JSON.stringify({
+        type: "attendance_session",
+        token: session.session_token,
+      })
+    : "";
+
+  if (loading) {
+    return (
+      <main className="min-h-screen bg-slate-50 px-6 py-10">
+        <div className="mx-auto max-w-4xl rounded-2xl bg-white p-8 shadow-sm">
+          <p className="text-slate-500">
+            Loading attendance...
+          </p>
+        </div>
+      </main>
+    );
+  }
+
+  if (!course) {
+    return (
+      <main className="min-h-screen bg-slate-50 px-6 py-10">
+        <div className="mx-auto max-w-4xl rounded-2xl bg-white p-8 shadow-sm">
+          <p className="text-red-600">
+            {error || "Course not found."}
+          </p>
+          <button
+            type="button"
+            onClick={() => router.back()}
+            className="mt-6 rounded-xl bg-slate-900 px-5 py-3 font-semibold text-white"
+          >
+            Go Back
+          </button>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="min-h-screen bg-slate-50 px-6 py-10">
       <div className="mx-auto max-w-4xl">
-        {/* Header */}
         <div className="mb-8">
           <button
             type="button"
@@ -331,147 +293,128 @@ export default function AttendancePage() {
           </button>
 
           <h1 className="text-3xl font-bold text-slate-900">
-            Attendance
+            QR Attendance
           </h1>
 
-          {course && (
-            <p className="mt-2 text-slate-500">
-              {course.course_code} — {course.course_name}
-            </p>
-          )}
+          <p className="mt-2 text-slate-500">
+            {course.course_code} — {course.course_name}
+          </p>
         </div>
 
-        {/* Main Attendance Card */}
-        <div className="rounded-2xl bg-white p-8 shadow-sm">
+        <section className="rounded-2xl bg-white p-6 shadow-sm sm:p-8">
           {!attendanceActive ? (
-            <>
-              {/* No active session */}
-              <div className="text-center">
-                <div className="mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-full bg-blue-50">
-                  <span className="text-3xl">✓</span>
-                </div>
+            <div className="py-6 text-center">
+              <div className="mx-auto mb-5 flex h-20 w-20 items-center justify-center rounded-full bg-blue-50 text-3xl">
+                QR
+              </div>
 
-                <h2 className="text-2xl font-bold text-slate-900">
-                  Ready to take attendance?
-                </h2>
+              <h2 className="text-2xl font-bold text-slate-900">
+                Ready to take attendance?
+              </h2>
 
-                <p className="mx-auto mt-3 max-w-lg text-slate-500">
-                  Start an attendance session to generate a
-                  unique 4-digit code. Students will use this
-                  code to mark their attendance.
+              <p className="mx-auto mt-3 max-w-lg text-slate-500">
+                Start a session to display a unique QR code.
+                The session expires automatically after 90 seconds.
+              </p>
+
+              {error && (
+                <p
+                  role="alert"
+                  className="mx-auto mt-5 max-w-md rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700"
+                >
+                  {error}
                 </p>
+              )}
 
-                {/* Error when starting */}
-                {error && (
-                  <div className="mx-auto mt-6 max-w-md rounded-xl bg-red-50 px-4 py-3 text-sm text-red-600">
-                    {error}
-                  </div>
-                )}
+              <button
+                type="button"
+                onClick={handleStartAttendance}
+                disabled={starting}
+                className="mt-8 rounded-xl bg-blue-600 px-8 py-4 text-lg font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {starting ? "Starting..." : "Start Attendance"}
+              </button>
+            </div>
+          ) : (
+            <div className="text-center">
+              <span className="inline-flex rounded-full bg-green-100 px-4 py-2 text-sm font-semibold text-green-700">
+                Attendance Active
+              </span>
 
-                {/* START BUTTON */}
+              <h2 className="mt-5 text-2xl font-bold text-slate-900">
+                Scan to identify this session
+              </h2>
+
+              <p className="mx-auto mt-2 max-w-lg text-sm text-slate-500">
+                Keep this QR code visible while the session is active.
+              </p>
+
+              <div className="mx-auto mt-6 inline-flex rounded-2xl border border-slate-200 bg-white p-4">
+                <QRCodeSVG
+                  value={qrPayload}
+                  size={240}
+                  level="H"
+                  includeMargin
+                  title="Attendance session QR code"
+                />
+              </div>
+
+              <p className="mt-5 text-sm text-slate-500">
+                Session expires in
+              </p>
+
+              <p className="mt-1 text-4xl font-bold text-blue-600">
+                {formatTime(timeLeft)}
+              </p>
+
+              <p className="mx-auto mt-5 max-w-xl rounded-xl bg-amber-50 px-5 py-4 text-sm text-amber-800">
+                Integration pending: the student portal must
+                recognize this QR payload and submit the token
+                to the backend before attendance can be recorded.
+              </p>
+
+              {error && (
+                <p
+                  role="alert"
+                  className="mt-5 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700"
+                >
+                  {error}
+                </p>
+              )}
+
+              <div className="mt-8 flex flex-col justify-center gap-3 sm:flex-row">
                 <button
                   type="button"
                   onClick={handleStartAttendance}
                   disabled={starting}
-                  className="mt-8 rounded-xl bg-blue-600 px-8 py-4 text-lg font-semibold text-white shadow-sm transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+                  className="rounded-xl border border-slate-300 px-6 py-3 font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60"
                 >
-                  {starting
-                    ? "Starting..."
-                    : "Start Attendance"}
+                  {starting ? "Checking..." : "Start New Session"}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={viewHistory}
+                  className="rounded-xl border border-blue-200 px-6 py-3 font-semibold text-blue-600 hover:bg-blue-50"
+                >
+                  View Attendance History
                 </button>
               </div>
-            </>
-          ) : (
-            <>
-              {/* Active Session */}
-              <div className="text-center">
-                <div className="mb-4 inline-flex rounded-full bg-green-100 px-4 py-2 text-sm font-semibold text-green-700">
-                  Attendance Active
-                </div>
-
-                <h2 className="text-xl font-semibold text-slate-900">
-                  Attendance Code
-                </h2>
-
-                <div className="mt-5 text-6xl font-bold tracking-[0.3em] text-slate-900">
-                  {session.attendance_code}
-                </div>
-
-                <p className="mt-6 text-sm text-slate-500">
-                  Students should enter this code in the
-                  student app.
-                </p>
-
-                {/* Countdown */}
-                <div className="mt-6">
-                  <p className="text-sm font-medium text-slate-500">
-                    Code expires in
-                  </p>
-
-                  <p className="mt-1 text-4xl font-bold text-blue-600">
-                    {formatTime(timeLeft)}
-                  </p>
-                </div>
-
-                <div className="mx-auto mt-8 max-w-xl rounded-xl bg-blue-50 px-5 py-4 text-sm text-blue-700">
-                  Keep this code visible while students are
-                  marking attendance. The code will expire
-                  automatically after 90 seconds.
-                </div>
-
-                {/* Error */}
-                {error && (
-                  <div className="mx-auto mt-6 max-w-md rounded-xl bg-red-50 px-4 py-3 text-sm text-red-600">
-                    {error}
-                  </div>
-                )}
-
-                {/* ACTIVE SESSION BUTTONS */}
-                <div className="mt-8 flex flex-col justify-center gap-3 sm:flex-row">
-                  <button
-                    type="button"
-                    onClick={handleStartAttendance}
-                    disabled={starting}
-                    className="rounded-xl border border-slate-300 px-6 py-3 font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {starting
-                      ? "Starting..."
-                      : "Start New Session"}
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() =>
-                      router.push(
-                        `/dashboard/courses/${courseId}/attendance/history`
-                      )
-                    }
-                    className="rounded-xl border border-blue-200 px-6 py-3 font-semibold text-blue-600 transition hover:bg-blue-50"
-                  >
-                    View Attendance History
-                  </button>
-                </div>
-              </div>
-            </>
+            </div>
           )}
 
-          {/* HISTORY BUTTON WHEN THERE IS NO ACTIVE SESSION */}
           {!attendanceActive && (
             <div className="mt-4 flex justify-center">
               <button
                 type="button"
-                onClick={() =>
-                  router.push(
-                    `/dashboard/courses/${courseId}/attendance/history`
-                  )
-                }
-                className="rounded-xl border border-blue-200 px-6 py-3 font-semibold text-blue-600 transition hover:bg-blue-50"
+                onClick={viewHistory}
+                className="rounded-xl border border-blue-200 px-6 py-3 font-semibold text-blue-600 hover:bg-blue-50"
               >
                 View Attendance History
               </button>
             </div>
           )}
-        </div>
+        </section>
       </div>
     </main>
   );
